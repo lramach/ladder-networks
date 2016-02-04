@@ -21,7 +21,7 @@ from blocks.graph import ComputationGraph
 from blocks.main_loop import MainLoop
 from blocks.model import Model
 from blocks.roles import PARAMETER
-from fuel.datasets import MNIST, CIFAR10
+from fuel.datasets import MNIST, CIFAR10, Aspire
 from fuel.schemes import ShuffledScheme, SequentialScheme
 from fuel.streams import DataStream
 from fuel.transformers import Transformer
@@ -38,6 +38,7 @@ from nn import ApproxTestMonitoring, FinalTestMonitoring, TestMonitoring
 from nn import LRDecay
 from ladder import LadderAE
 
+from sklearn.metrics import *
 
 class Whitening(Transformer):
     """ Makes a copy of the examples in the underlying dataset and whitens it
@@ -127,7 +128,7 @@ def unify_labels(y):
     return y
 
 
-def make_datastream(dataset, indices, batch_size,
+def make_datastream(dataset, indices, batch_size, output_type,
                     n_labeled=None, n_unlabeled=None,
                     balanced_classes=True, whiten=None, cnorm=None,
                     scheme=ShuffledScheme):
@@ -144,6 +145,7 @@ def make_datastream(dataset, indices, batch_size,
         logger.info('Balancing %d labels...' % n_labeled)
         all_data = dataset.data_sources[dataset.sources.index('targets')]
         y = unify_labels(all_data)[indices]
+        print('y.shape', y.shape)
         n_classes = y.max() + 1
         assert n_labeled % n_classes == 0
         n_from_each_class = n_labeled / n_classes
@@ -155,6 +157,10 @@ def make_datastream(dataset, indices, batch_size,
     else:
         i_labeled = indices[:n_labeled]
 
+    ## Print the indices of the train set used for the baseline model
+    #if n_labeled == 72000:
+      #numpy.savetxt("results/train_indices_72000.csv", i_labeled, delimiter=",")
+    
     # Get unlabeled indices
     i_unlabeled = indices[:n_unlabeled]
 
@@ -177,12 +183,15 @@ def setup_model(p):
     input_type = TensorType('float32', [False] * (len(p.encoder_layers[0]) + 1))
     x_only = input_type('features_unlabeled')
     x = input_type('features_labeled')
+    #if p.output_type == 'classification':
     y = theano.tensor.lvector('targets_labeled')
+    #else:
+    #    y = theano.tensor.matrix('targets_labeled')
     ladder.apply(x, y, x_only)
 
     # Load parameters if requested
     if p.get('load_from'):
-        with open(p.load_from + '/trained_params.npz') as f:
+        with open(p.load_from + '/trained_params_best.npz') as f:
             loaded = numpy.load(f)
             cg = ComputationGraph([ladder.costs.total])
             current_params = VariableFilter(roles=[PARAMETER])(cg.variables)
@@ -231,14 +240,17 @@ def setup_data(p, test_set=False):
     dataset_class, training_set_size = {
         'cifar10': (CIFAR10, 40000),
         'mnist': (MNIST, 50000),
+        'aspire': (Aspire, 72000)
     }[p.dataset]
+    #print(dataset_class)
+    #print(training_set_size)
 
     # Allow overriding the default from command line
     if p.get('unlabeled_samples') is not None:
         training_set_size = p.unlabeled_samples
 
     train_set = dataset_class("train")
-
+    valid_set = dataset_class("valid")
     # Make sure the MNIST data is in right format
     if p.dataset == 'mnist':
         d = train_set.data_sources[train_set.sources.index('features')]
@@ -255,11 +267,15 @@ def setup_data(p, test_set=False):
 
     # Choose the training set
     d.train = train_set
+    print('Number of train features: ',train_set.data_sources[train_set.sources.index('features')].shape)
     d.train_ind = all_ind[:training_set_size]
 
     # Then choose validation set from the remaining indices
-    d.valid = train_set
-    d.valid_ind = numpy.setdiff1d(all_ind, d.train_ind)[:p.valid_set_size]
+    d.valid = valid_set #train_set
+    p.valid_set_size = valid_set.num_examples
+    #d.valid_ind = numpy.setdiff1d(all_ind, d.train_ind)[:p.valid_set_size]
+    d.valid_ind = numpy.arange(valid_set.num_examples)
+    logger.info('Using %d examples for training' % len(d.train_ind))
     logger.info('Using %d examples for validation' % len(d.valid_ind))
 
     # Only touch test data if requested
@@ -297,10 +313,22 @@ def get_error(args):
     args['no_load'] = 'g_'
 
     targets, acts = analyze(args)
-    guess = numpy.argmax(acts, axis=1)
-    correct = numpy.sum(numpy.equal(guess, targets.flatten()))
-
-    return (1. - correct / float(len(guess))) * 100.
+    if args['output_type'] == 'classification':
+        guess = numpy.argmax(acts, axis=1)
+        correct = numpy.sum(numpy.equal(guess, targets.flatten()))
+    else:
+        guess = numpy.round(acts)
+        guess[guess < 0] = 0
+        guess[guess >= numpy.max(targets)] = numpy.max(targets)
+        correct = numpy.sum(numpy.equal(guess, targets))
+    print('guess',len(guess))
+    print('targets',len(targets))
+    print('correct', correct)
+    accuracy = correct/float(len(guess))
+    print('accuracy', accuracy * 100.)
+    fmeasures = f1_score(targets, guess, average=None)
+    print('f-measure:', fmeasures)
+    return (1. - accuracy) * 100.
 
 
 def analyze(cli_params):
@@ -325,12 +353,13 @@ def analyze(cli_params):
                     make_datastream(data.train, data.train_ind,
                                     # These need to match with the training
                                     p.batch_size,
+                                    p.output_type,
                                     n_labeled=p.labeled_samples,
                                     n_unlabeled=len(data.train_ind),
                                     cnorm=cnorm,
                                     whiten=whiten, scheme=ShuffledScheme),
                     make_datastream(data.valid, data.valid_ind,
-                                    p.valid_batch_size,
+                                    p.valid_batch_size, p.output_type,
                                     n_labeled=len(data.valid_ind),
                                     n_unlabeled=len(data.valid_ind),
                                     cnorm=cnorm,
@@ -351,7 +380,8 @@ def analyze(cli_params):
 
     # Make a datastream that has all the indices in the labeled pathway
     ds = make_datastream(dset, indices,
-                         batch_size=p.get('batch_size'),
+                         p.get('batch_size'),
+                         p.output_type,
                          n_labeled=len(indices),
                          n_unlabeled=len(indices),
                          balanced_classes=False,
@@ -385,9 +415,19 @@ def analyze(cli_params):
 
     # Concatenate all minibatches
     res = [numpy.vstack(minibatches) for minibatches in zip(*res)]
-    inputs = {k: numpy.vstack(v) for k, v in inputs.iteritems()}
-
-    return inputs['targets_labeled'], res[0]
+    actuals = []
+    for k, v in inputs.iteritems():
+        #print('k', k)
+        #print('v', len(v))
+        if(k == 'targets_labeled'):
+          for vals in v:
+            actuals = numpy.append(actuals, vals)
+    
+    actuals = numpy.reshape(actuals, (len(actuals),1))
+    #print('results', results.shape)
+    #inputs = {k: numpy.vstack(v) for k, v in inputs.iteritems()}
+    #return inputs['targets_labeled'], res[0]
+    return actuals, res[0]
 
 
 def train(cli_params):
@@ -402,6 +442,7 @@ def train(cli_params):
     logger.info('Logging into %s' % logfile)
 
     p, loaded = load_and_log_params(cli_params)
+    print("p.dataset", p.dataset)
     in_dim, data, whiten, cnorm = setup_data(p, test_set=False)
     if not loaded:
         # Set the zero layer to match input dimensions
@@ -440,12 +481,12 @@ def train(cli_params):
             ('VF_C_de', ladder.costs.denois.values()),
         ]),
     }
-
     main_loop = MainLoop(
         training_algorithm,
         # Datastream used for training
         make_datastream(data.train, data.train_ind,
                         p.batch_size,
+                        p.output_type,
                         n_labeled=p.labeled_samples,
                         n_unlabeled=p.unlabeled_samples,
                         whiten=whiten,
@@ -461,7 +502,9 @@ def train(cli_params):
                 [ladder.costs.class_clean, ladder.error.clean]
                 + ladder.costs.denois.values(),
                 make_datastream(data.valid, data.valid_ind,
-                                p.valid_batch_size, whiten=whiten, cnorm=cnorm,
+                                p.valid_batch_size,
+                                p.output_type,
+                                whiten=whiten, cnorm=cnorm,
                                 scheme=ShuffledScheme),
                 prefix="valid_approx"),
 
@@ -473,11 +516,13 @@ def train(cli_params):
                 + ladder.costs.denois.values(),
                 make_datastream(data.train, data.train_ind,
                                 p.batch_size,
+                                p.output_type,
                                 n_labeled=p.labeled_samples,
                                 whiten=whiten, cnorm=cnorm,
                                 scheme=ShuffledScheme),
                 make_datastream(data.valid, data.valid_ind,
                                 p.valid_batch_size,
+                                p.output_type,
                                 n_labeled=len(data.valid_ind),
                                 whiten=whiten, cnorm=cnorm,
                                 scheme=ShuffledScheme),
@@ -490,7 +535,7 @@ def train(cli_params):
                 + ladder.costs.denois.values(),
                 prefix="train", after_epoch=True),
 
-            SaveParams(None, all_params, p.save_dir, after_epoch=True),
+            SaveParams('valid_approx_error_rate_clean', all_params, p.save_dir, p.patience, after_epoch=True),
             SaveExpParams(p, p.save_dir, before_training=True),
             SaveLog(p.save_dir, after_training=True),
             ShortPrinting(short_prints),
@@ -501,7 +546,9 @@ def train(cli_params):
 
     # Get results
     df = main_loop.log.to_dataframe()
-    col = 'valid_final_error_rate_clean'
+    print('df', df)
+    #col = 'valid_final_error_rate_clean'
+    col = 'valid_approx_error_rate_clean'
     logger.info('%s %g' % (col, df[col].iloc[-1]))
 
     if main_loop.log.status['epoch_interrupt_received']:
@@ -562,7 +609,7 @@ if __name__ == "__main__":
         a("--unlabeled-samples", help="How many unsupervised samples are used",
           type=int, default=default(None), nargs='+')
         a("--dataset", type=str, default=default(['mnist']), nargs='+',
-          choices=['mnist', 'cifar10'], help="Which dataset to use")
+          choices=['mnist', 'cifar10', 'aspire'], help="Which dataset to use")
         a("--lr", help="Initial learning rate",
           type=float, default=default([0.002]), nargs='+')
         a("--lrate-decay", help="When to linearly start decaying lrate (0-1)",
@@ -601,6 +648,13 @@ if __name__ == "__main__":
           default=default([True]), nargs='+')
         a("--whiten-zca", help="Whether to whiten the data with ZCA",
           type=int, default=default([0]), nargs='+')
+        
+        # Output types
+        a("--output-type", help="Output type ('classification', 'regression')",
+                type=str, default='classification', choices=('classification', 'regression'))
+
+        a("--patience", help="Number of epochs to wait before stopping",
+                type=int, default=50)
 
     ap = ArgumentParser("Semisupervised experiment")
     subparsers = ap.add_subparsers(dest='cmd', help='sub-command help')
@@ -615,7 +669,8 @@ if __name__ == "__main__":
                           help="Destination to load the state from")
     load_cmd.add_argument('--data-type', type=str, default='test',
                           help="Data set to evaluate on")
-
+    load_cmd.add_argument('--output-type', type=str, default='classification',
+            help="Output type")
     args = ap.parse_args()
 
     subp = subprocess.Popen(['git', 'rev-parse', 'HEAD'],
@@ -633,7 +688,7 @@ if __name__ == "__main__":
                 assert len(v) == 1, "should not be a list when loading: %s" % k
                 logger.info("%s" % str(v[0]))
                 vars(args)[k] = v[0]
-
+        print('args', vars(args))
         err = get_error(vars(args))
         logger.info('Test error: %f' % err)
 

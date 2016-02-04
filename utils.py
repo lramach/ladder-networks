@@ -85,34 +85,52 @@ class ShortPrinting(Printing):
 
 class SaveParams(SimpleExtension):
     """Finishes the training process when triggered."""
-    def __init__(self, trigger_var, params, save_path, **kwargs):
+    def __init__(self, trigger_var, params, save_path, patience, **kwargs):
         super(SaveParams, self).__init__(**kwargs)
-        if trigger_var is None:
-            self.var_name = None
-        else:
-            self.var_name = trigger_var[0] + '_' + trigger_var[1].name
+        #if trigger_var is None:
+        #    self.var_name = None
+        #else:
+        #    self.var_name = trigger_var[0] + '_' + trigger_var[1].name
+        #self.var_name = 'valid_approx_cost_class_clean'
+        self.var_name = trigger_var 
         self.save_path = save_path
         self.params = params
         self.to_save = {}
         self.best_value = None
         self.add_condition('after_training', self.save)
         self.add_condition('on_interrupt', self.save)
+        ## Setting patience and initializing epochs
+        self.patience = patience
+        self.patience_epochs = 0
 
     def save(self, which_callback, *args):
-        if self.var_name is None:
-            self.to_save = {v.name: v.get_value() for v in self.params}
+        #if self.var_name is None:
+        self.to_save = {v.name: v.get_value() for v in self.params}
         path = self.save_path + '/trained_params'
-        logger.info('Saving to %s' % path)
         np.savez_compressed(path, **self.to_save)
 
     def do(self, which_callback, *args):
+        #print('==> self.var_name', self.var_name)
+        #print('==> self.main_loop.log.current_row', self.main_loop.log.current_row)
+        #print('==> self.patience', self.patience)
+        print('==> self.patience_epochs', self.patience_epochs)
         if self.var_name is None:
             return
         val = self.main_loop.log.current_row[self.var_name]
-        if self.best_value is None or val < self.best_value:
+        if self.best_value is None or val < self.best_value: #Performance improved
             self.best_value = val
-        self.to_save = {v.name: v.get_value() for v in self.params}
-
+            to_save = {}
+            to_save = {v.name: v.get_value() for v in self.params}
+            #self.to_save = {v.name: v.get_value() for v in self.params}
+            path = self.save_path + '/trained_params_best'
+            logger.info('Saving to %s' % path)
+            np.savez_compressed(path, **to_save)
+            #reset the patience_epochs
+            self.patience_epochs = 0
+        else: #No performance improvement
+            self.patience_epochs += 1
+            if(self.patience_epochs > self.patience):
+               self.main_loop.log.current_row['training_finish_requested'] = True 
 
 class SaveExpParams(SimpleExtension):
     def __init__(self, experiment_params, dir, **kwargs):
@@ -122,8 +140,9 @@ class SaveExpParams(SimpleExtension):
 
     def do(self, which_callback, *args):
         df = DataFrame.from_dict(self.experiment_params, orient='index')
+        print(os.path.join(self.dir, 'params'))
         df.to_hdf(os.path.join(self.dir, 'params'), 'params', mode='w',
-                  complevel=5, complib='blosc')
+                complevel=5, complib='blosc')
 
 
 class SaveLog(SimpleExtension):

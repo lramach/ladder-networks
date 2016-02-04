@@ -59,7 +59,13 @@ class LadderAE():
         assert (n_layers == len(acts)), (
             "Not enough activations given. Requires %d. Got: %s" %
             (n_layers, str(acts)))
-        acts = acts[:-1] + ('softmax',)
+
+        print('acts', acts)
+        if p.output_type =='classification':
+            acts = acts[:-1] + ('softmax',)
+        else:
+            acts = acts[:-1] + ('linear',)
+        print('acts', acts)
 
         def parse_layer(spec):
             """ 'fc:5' -> ('fc', 5)
@@ -259,14 +265,20 @@ class LadderAE():
                 ))
 
         # Costs
-        y = target_labeled.flatten()
-
-        costs.class_clean = CategoricalCrossEntropy().apply(y, clean.labeled.h[top])
+        print('self.p.output_type', self.p.output_type)
+        if self.p.output_type == 'classification':
+            y = target_labeled.flatten()
+            costs.class_clean = CategoricalCrossEntropy().apply(y, clean.labeled.h[top])
+            costs.class_corr = CategoricalCrossEntropy().apply(y, corr.labeled.h[top])
+        else:
+            #y = target_labeled
+            y = target_labeled.reshape((target_labeled.shape[0], 1))
+            costs.class_clean = SquaredError().apply(y, clean.labeled.h[top])
+            costs.class_corr = SquaredError().apply(y, corr.labeled.h[top])
+        
         costs.class_clean.name = 'cost_class_clean'
-
-        costs.class_corr = CategoricalCrossEntropy().apply(y, corr.labeled.h[top])
         costs.class_corr.name = 'cost_class_corr'
-
+        
         # This will be used for training
         costs.total = costs.class_corr * 1.0
         for i in range(top + 1):
@@ -276,7 +288,10 @@ class LadderAE():
 
         # Classification error
         mr = MisclassificationRate()
-        self.error.clean = mr.apply(y, clean.labeled.h[top]) * np.float32(100.)
+        if self.p.output_type == 'classification':
+            self.error.clean = mr.apply(y, clean.labeled.h[top]) * np.float32(100.)
+        else: #Round the values for regression
+            self.error.clean = SquaredError().apply(y, clean.labeled.h[top]) #mr.apply(y, np.round(clean.labeled.h[top])) * np.float32(100.)
         self.error.clean.name = 'error_rate_clean'
 
     def apply_act(self, input, act_name):
